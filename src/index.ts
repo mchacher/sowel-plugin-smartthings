@@ -367,28 +367,39 @@ class SmartThingsPlugin implements IntegrationPlugin {
     const payload: Record<string, unknown> = {};
 
     const switchVal = this.getAttr(main, "switch", "switch");
-    payload["power"] = switchVal === "on";
+    const isOn = switchVal === "on";
+    payload["power"] = isOn;
 
-    const operatingState =
-      this.getAttr(main, "samsungce.washerOperatingState", "operatingState") ??
-      this.getAttr(main, "washerOperatingState", "machineState");
-    if (operatingState !== null) payload["state"] = operatingState;
+    if (isOn) {
+      // Only report cycle data when machine is powered on
+      const operatingState =
+        this.getAttr(main, "samsungce.washerOperatingState", "operatingState") ??
+        this.getAttr(main, "washerOperatingState", "machineState");
+      if (operatingState !== null) payload["state"] = operatingState;
 
-    const jobPhase =
-      this.getAttr(main, "samsungce.washerOperatingState", "washerJobPhase") ??
-      this.getAttr(main, "washerOperatingState", "washerJobState");
-    if (jobPhase !== null) payload["job_phase"] = jobPhase;
+      const jobPhase =
+        this.getAttr(main, "samsungce.washerOperatingState", "washerJobPhase") ??
+        this.getAttr(main, "washerOperatingState", "washerJobState");
+      if (jobPhase !== null) payload["job_phase"] = jobPhase;
 
-    const progress = this.getAttr(main, "samsungce.washerOperatingState", "progress");
-    if (typeof progress === "number") payload["progress"] = progress;
+      const progress = this.getAttr(main, "samsungce.washerOperatingState", "progress");
+      if (typeof progress === "number") payload["progress"] = progress;
 
-    const remainingTime = this.getAttr(main, "samsungce.washerOperatingState", "remainingTime");
-    if (typeof remainingTime === "number") payload["remaining_time"] = remainingTime;
+      const remainingTime = this.getAttr(main, "samsungce.washerOperatingState", "remainingTime");
+      if (typeof remainingTime === "number") payload["remaining_time"] = remainingTime;
 
-    const remainingTimeStr = this.getAttr(main, "samsungce.washerOperatingState", "remainingTimeStr");
-    if (remainingTimeStr !== null) payload["remaining_time_str"] = String(remainingTimeStr);
+      const remainingTimeStr = this.getAttr(main, "samsungce.washerOperatingState", "remainingTimeStr");
+      if (remainingTimeStr !== null) payload["remaining_time_str"] = String(remainingTimeStr);
+    } else {
+      // Machine off — clear cycle data
+      payload["state"] = "off";
+      payload["job_phase"] = "none";
+      payload["progress"] = 0;
+      payload["remaining_time"] = 0;
+      payload["remaining_time_str"] = "";
+    }
 
-    // Energy
+    // Energy — always report (cumulative)
     const powerConsumption = this.getAttr(main, "powerConsumptionReport", "powerConsumption") as {
       energy?: number;
     } | null;
