@@ -187,6 +187,9 @@ class SmartThingsPlugin implements IntegrationPlugin {
   /** SmartThings deviceId → STDevice */
   private knownDevices = new Map<string, STDevice>();
 
+  /** Previous energy counter per device label — for delta calculation */
+  private previousEnergy = new Map<string, number>();
+
   constructor(deps: PluginDeps) {
     this.logger = deps.logger;
     this.eventBus = deps.eventBus;
@@ -399,11 +402,23 @@ class SmartThingsPlugin implements IntegrationPlugin {
       payload["remaining_time_str"] = "";
     }
 
-    // Energy — always report (cumulative)
+    // Energy — compute delta from cumulative counter
     const powerConsumption = this.getAttr(main, "powerConsumptionReport", "powerConsumption") as {
       energy?: number;
     } | null;
-    if (powerConsumption?.energy !== undefined) payload["energy"] = powerConsumption.energy;
+    if (powerConsumption?.energy !== undefined) {
+      const currentEnergy = powerConsumption.energy;
+      const previousEnergy = this.previousEnergy.get(deviceLabel);
+      this.previousEnergy.set(deviceLabel, currentEnergy);
+
+      if (previousEnergy !== undefined && currentEnergy >= previousEnergy) {
+        const delta = currentEnergy - previousEnergy;
+        if (delta > 0) {
+          payload["energy"] = delta;
+        }
+      }
+      // First poll: skip (no previous value to compute delta)
+    }
 
     this.deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, payload);
   }
