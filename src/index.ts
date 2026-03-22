@@ -187,8 +187,7 @@ class SmartThingsPlugin implements IntegrationPlugin {
   /** SmartThings deviceId → STDevice */
   private knownDevices = new Map<string, STDevice>();
 
-  /** Previous energy counter per device label — for delta calculation */
-  private previousEnergy = new Map<string, number>();
+  // previousEnergy is persisted in settings to survive restarts
 
   constructor(deps: PluginDeps) {
     this.logger = deps.logger;
@@ -397,22 +396,26 @@ class SmartThingsPlugin implements IntegrationPlugin {
     // When power=off, don't update state/progress/time — keep last known values.
     // This prevents state-watch from seeing off→ready transitions on every poll cycle.
 
-    // Energy — compute delta from cumulative counter
+    // Energy — compute delta from cumulative counter, persisted in settings
     const powerConsumption = this.getAttr(main, "powerConsumptionReport", "powerConsumption") as {
       energy?: number;
     } | null;
     if (powerConsumption?.energy !== undefined) {
       const currentEnergy = powerConsumption.energy;
-      const previousEnergy = this.previousEnergy.get(deviceLabel);
-      this.previousEnergy.set(deviceLabel, currentEnergy);
+      const settingsKey = `integration.${INTEGRATION_ID}.energy_prev_${deviceLabel.replace(/\s+/g, "_")}`;
+      const previousStr = this.settingsManager.get(settingsKey);
+      const previousEnergy = previousStr !== undefined ? parseFloat(previousStr) : undefined;
 
-      if (previousEnergy !== undefined && currentEnergy >= previousEnergy) {
+      // Always persist current value for next poll (survives restarts)
+      this.settingsManager.set(settingsKey, String(currentEnergy));
+
+      if (previousEnergy !== undefined && !isNaN(previousEnergy) && currentEnergy >= previousEnergy) {
         const delta = currentEnergy - previousEnergy;
         if (delta > 0) {
           payload["energy"] = delta;
         }
       }
-      // First poll: skip (no previous value to compute delta)
+      // First poll or after restart: skip (no previous value to compute delta)
     }
 
     this.deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, payload);
