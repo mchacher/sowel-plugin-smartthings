@@ -11,60 +11,83 @@
  */
 
 // ============================================================
-// Types — mirrors Sowel's plugin API without importing
+// Local type definitions (no imports from Sowel source)
 // ============================================================
 
 interface Logger {
+  child(bindings: Record<string, unknown>): Logger;
   info(obj: Record<string, unknown>, msg: string): void;
+  info(msg: string): void;
   warn(obj: Record<string, unknown>, msg: string): void;
+  warn(msg: string): void;
   error(obj: Record<string, unknown>, msg: string): void;
+  error(msg: string): void;
   debug(obj: Record<string, unknown>, msg: string): void;
-  trace(obj: Record<string, unknown>, msg: string): void;
+  debug(msg: string): void;
+}
+
+interface EventBus {
+  emit(event: unknown): void;
 }
 
 interface SettingsManager {
   get(key: string): string | undefined;
+  set(key: string, value: string): void;
+}
+
+interface DiscoveredDevice {
+  ieeeAddress?: string;
+  friendlyName: string;
+  manufacturer?: string;
+  model?: string;
+  data: {
+    key: string;
+    type: string;
+    category: string;
+    unit?: string;
+  }[];
+  orders: {
+    key: string;
+    type: string;
+    dispatchConfig: Record<string, unknown>;
+    min?: number;
+    max?: number;
+    enumValues?: string[];
+    unit?: string;
+  }[];
 }
 
 interface DeviceManager {
   upsertFromDiscovery(
     integrationId: string,
     source: string,
-    devices: DiscoveredDevice[],
+    discovered: DiscoveredDevice,
   ): void;
   updateDeviceData(
     integrationId: string,
     sourceDeviceId: string,
-    key: string,
-    value: unknown,
-    meta?: { type?: string; category?: string; unit?: string },
+    payload: Record<string, unknown>,
   ): void;
 }
 
-interface DiscoveredDevice {
+interface Device {
+  id: string;
+  integrationId: string;
   sourceDeviceId: string;
-  friendlyName: string;
+  name: string;
   manufacturer?: string;
   model?: string;
-  data?: Array<{
-    key: string;
-    value: unknown;
-    type?: string;
-    category?: string;
-    unit?: string;
-  }>;
-  orders?: Array<{
-    key: string;
-    type: string;
-    enumValues?: string[];
-    min?: number;
-    max?: number;
-  }>;
 }
 
-interface EventBus {
-  on(handler: (event: unknown) => void): () => void;
+interface PluginDeps {
+  logger: Logger;
+  eventBus: EventBus;
+  settingsManager: SettingsManager;
+  deviceManager: DeviceManager;
+  pluginDir: string;
 }
+
+type IntegrationStatus = "connected" | "disconnected" | "not_configured" | "error";
 
 interface IntegrationSettingDef {
   key: string;
@@ -75,31 +98,24 @@ interface IntegrationSettingDef {
   defaultValue?: string;
 }
 
-type IntegrationStatus = "connected" | "disconnected" | "not_configured" | "error";
-
 interface IntegrationPlugin {
-  id: string;
-  name: string;
-  description: string;
-  icon: string;
-  getSettings(): IntegrationSettingDef[];
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
+  readonly icon: string;
   getStatus(): IntegrationStatus;
   isConfigured(): boolean;
-  start(): Promise<void>;
+  getSettingsSchema(): IntegrationSettingDef[];
+  start(options?: { pollOffset?: number }): Promise<void>;
   stop(): Promise<void>;
-  executeOrder?(deviceSourceId: string, key: string, value: unknown): Promise<void>;
+  executeOrder(
+    device: Device,
+    dispatchConfig: Record<string, unknown>,
+    value: unknown,
+  ): Promise<void>;
+  refresh?(): Promise<void>;
   getPollingInfo?(): { lastPollAt: string; intervalMs: number } | null;
 }
-
-interface PluginDeps {
-  logger: Logger;
-  settingsManager: SettingsManager;
-  deviceManager: DeviceManager;
-  eventBus: EventBus;
-  pluginDir: string;
-}
-
-type PluginFactory = (deps: PluginDeps) => IntegrationPlugin;
 
 // ============================================================
 // SmartThings API types
@@ -126,6 +142,7 @@ interface STDeviceStatus {
 // ============================================================
 
 const INTEGRATION_ID = "smartthings";
+const SOURCE = "smartthings";
 const API_BASE = "https://api.smartthings.com/v1";
 const MIN_POLL_INTERVAL = 60_000;
 const DEFAULT_POLL_INTERVAL = 300_000;
@@ -149,36 +166,70 @@ const SETTINGS: IntegrationSettingDef[] = [
 ];
 
 // ============================================================
-// Plugin implementation
+// Plugin factory
 // ============================================================
 
-export function createPlugin(deps: PluginDeps): IntegrationPlugin {
-  const { logger, settingsManager, deviceManager } = deps;
+class SmartThingsPlugin implements IntegrationPlugin {
+  readonly id = INTEGRATION_ID;
+  readonly name = "Samsung SmartThings";
+  readonly description = "Samsung SmartThings devices (TV, washing machine, and more)";
+  readonly icon = "Smartphone";
 
-  let status: IntegrationStatus = "disconnected";
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
-  let lastPollAt: string | null = null;
-  let pollIntervalMs = DEFAULT_POLL_INTERVAL;
+  private logger: Logger;
+  private eventBus: EventBus;
+  private settingsManager: SettingsManager;
+  private deviceManager: DeviceManager;
+  private status: IntegrationStatus = "disconnected";
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private lastPollAt: string | null = null;
+  private pollIntervalMs = DEFAULT_POLL_INTERVAL;
 
-  // Known devices from last discovery
-  const knownDevices = new Map<string, STDevice>();
+  /** SmartThings deviceId → STDevice */
+  private knownDevices = new Map<string, STDevice>();
 
-  // ── Helpers ──────────────────────────────────────────────
-
-  function getSetting(key: string): string | undefined {
-    return settingsManager.get(`integration.${INTEGRATION_ID}.${key}`);
+  constructor(deps: PluginDeps) {
+    this.logger = deps.logger;
+    this.eventBus = deps.eventBus;
+    this.settingsManager = deps.settingsManager;
+    this.deviceManager = deps.deviceManager;
   }
 
-  function getToken(): string {
-    const token = getSetting("token");
+  // ── Settings ─────────────────────────────────────────────
+
+  getSettingsSchema(): IntegrationSettingDef[] {
+    return SETTINGS;
+  }
+
+  getStatus(): IntegrationStatus {
+    return this.status;
+  }
+
+  isConfigured(): boolean {
+    return !!this.getSetting("token");
+  }
+
+  getPollingInfo() {
+    return this.lastPollAt
+      ? { lastPollAt: this.lastPollAt, intervalMs: this.pollIntervalMs }
+      : null;
+  }
+
+  private getSetting(key: string): string | undefined {
+    return this.settingsManager.get(`integration.${INTEGRATION_ID}.${key}`);
+  }
+
+  // ── API helpers ──────────────────────────────────────────
+
+  private getToken(): string {
+    const token = this.getSetting("token");
     if (!token) throw new Error("SmartThings PAT not configured");
     return token;
   }
 
-  async function apiGet<T>(path: string): Promise<T> {
+  private async apiGet<T>(path: string): Promise<T> {
     const res = await fetch(`${API_BASE}${path}`, {
       headers: {
-        Authorization: `Bearer ${getToken()}`,
+        Authorization: `Bearer ${this.getToken()}`,
         Accept: "application/json",
       },
     });
@@ -188,11 +239,11 @@ export function createPlugin(deps: PluginDeps): IntegrationPlugin {
     return res.json() as Promise<T>;
   }
 
-  async function apiPost(path: string, body: unknown): Promise<void> {
+  private async apiPost(path: string, body: unknown): Promise<void> {
     const res = await fetch(`${API_BASE}${path}`, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${getToken()}`,
+        Authorization: `Bearer ${this.getToken()}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -203,86 +254,85 @@ export function createPlugin(deps: PluginDeps): IntegrationPlugin {
     }
   }
 
-  // ── Device type detection ────────────────────────────────
+  // ── Device detection ─────────────────────────────────────
 
-  function isTV(device: STDevice): boolean {
+  private isTV(device: STDevice): boolean {
     return device.deviceTypeName.includes("TV");
   }
 
-  function isWasher(device: STDevice): boolean {
+  private isWasher(device: STDevice): boolean {
     return device.deviceTypeName.includes("Washer");
   }
 
   // ── Discovery ────────────────────────────────────────────
 
-  function buildDiscoveredDevice(device: STDevice): DiscoveredDevice {
-    const discovered: DiscoveredDevice = {
-      sourceDeviceId: device.label ?? device.name,
-      friendlyName: device.label ?? device.name,
-      manufacturer: device.manufacturerName ?? "Samsung",
-      model: device.deviceTypeName,
-      data: [],
-      orders: [],
-    };
+  private buildDiscoveredDevice(device: STDevice): DiscoveredDevice {
+    const friendlyName = device.label ?? device.name;
 
-    if (isTV(device)) {
-      discovered.data = [
-        { key: "power", value: null, type: "boolean", category: "generic" },
-        { key: "volume", value: null, type: "number", category: "generic" },
-        { key: "mute", value: null, type: "boolean", category: "generic" },
-        { key: "input_source", value: null, type: "enum", category: "generic" },
-        { key: "picture_mode", value: null, type: "enum", category: "generic" },
-      ];
-      discovered.orders = [
-        { key: "power", type: "boolean" },
-        { key: "volume", type: "number", min: 0, max: 100 },
-        { key: "mute", type: "boolean" },
-        { key: "input_source", type: "enum", enumValues: [] },
-      ];
-    } else if (isWasher(device)) {
-      discovered.data = [
-        { key: "power", value: null, type: "boolean", category: "generic" },
-        { key: "state", value: null, type: "enum", category: "generic" },
-        { key: "job_phase", value: null, type: "enum", category: "generic" },
-        { key: "progress", value: null, type: "number", category: "generic", unit: "%" },
-        { key: "remaining_time", value: null, type: "number", category: "generic", unit: "min" },
-        { key: "remaining_time_str", value: null, type: "text", category: "generic" },
-        { key: "energy", value: null, type: "number", category: "energy", unit: "Wh" },
-      ];
+    const data: DiscoveredDevice["data"] = [];
+    const orders: DiscoveredDevice["orders"] = [];
+
+    if (this.isTV(device)) {
+      data.push(
+        { key: "power", type: "boolean", category: "generic" },
+        { key: "volume", type: "number", category: "generic" },
+        { key: "mute", type: "boolean", category: "generic" },
+        { key: "input_source", type: "enum", category: "generic" },
+        { key: "picture_mode", type: "enum", category: "generic" },
+      );
+      orders.push(
+        { key: "power", type: "boolean", dispatchConfig: { command: "switch" } },
+        { key: "volume", type: "number", min: 0, max: 100, dispatchConfig: { command: "setVolume" } },
+        { key: "mute", type: "boolean", dispatchConfig: { command: "mute" } },
+        { key: "input_source", type: "enum", enumValues: [], dispatchConfig: { command: "setInputSource" } },
+      );
+    } else if (this.isWasher(device)) {
+      data.push(
+        { key: "power", type: "boolean", category: "generic" },
+        { key: "state", type: "enum", category: "generic" },
+        { key: "job_phase", type: "enum", category: "generic" },
+        { key: "progress", type: "number", category: "generic", unit: "%" },
+        { key: "remaining_time", type: "number", category: "generic", unit: "min" },
+        { key: "remaining_time_str", type: "text", category: "generic" },
+        { key: "energy", type: "number", category: "energy", unit: "Wh" },
+      );
     } else {
-      // Generic: expose power if switch capability present
+      // Generic: expose power
       const hasSwitchCap = device.components.some((c) =>
         c.capabilities.some((cap) => cap.id === "switch"),
       );
       if (hasSwitchCap) {
-        discovered.data = [
-          { key: "power", value: null, type: "boolean", category: "generic" },
-        ];
+        data.push({ key: "power", type: "boolean", category: "generic" });
       }
     }
 
-    return discovered;
+    return {
+      friendlyName,
+      manufacturer: device.manufacturerName ?? "Samsung",
+      model: device.deviceTypeName,
+      data,
+      orders,
+    };
   }
 
-  async function discover(): Promise<void> {
-    const result = await apiGet<{ items: STDevice[] }>("/devices");
+  private async discover(): Promise<void> {
+    const result = await this.apiGet<{ items: STDevice[] }>("/devices");
     const devices = result.items;
 
-    knownDevices.clear();
-    const discovered: DiscoveredDevice[] = [];
+    this.knownDevices.clear();
 
     for (const device of devices) {
-      knownDevices.set(device.deviceId, device);
-      discovered.push(buildDiscoveredDevice(device));
+      this.knownDevices.set(device.deviceId, device);
+      const discovered = this.buildDiscoveredDevice(device);
+      this.deviceManager.upsertFromDiscovery(INTEGRATION_ID, SOURCE, discovered);
     }
 
-    deviceManager.upsertFromDiscovery(INTEGRATION_ID, "smartthings", discovered);
-    logger.info({ count: devices.length }, "SmartThings devices discovered");
+    this.logger.info({ count: devices.length }, "SmartThings devices discovered");
   }
 
   // ── Status extraction ────────────────────────────────────
 
-  function getAttr(
+  private getAttr(
     main: Record<string, Record<string, { value: unknown }>>,
     capability: string,
     attribute: string,
@@ -290,194 +340,196 @@ export function createPlugin(deps: PluginDeps): IntegrationPlugin {
     return main[capability]?.[attribute]?.value ?? null;
   }
 
-  function updateTV(deviceLabel: string, main: Record<string, Record<string, { value: unknown }>>): void {
-    const switchVal = getAttr(main, "switch", "switch");
-    deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "power", switchVal === "on", {
-      type: "boolean",
-      category: "generic",
-    });
+  private updateTV(deviceLabel: string, main: Record<string, Record<string, { value: unknown }>>): void {
+    const payload: Record<string, unknown> = {};
 
-    const volume = getAttr(main, "audioVolume", "volume");
-    if (typeof volume === "number") {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "volume", volume, {
-        type: "number",
-        category: "generic",
-      });
-    }
+    const switchVal = this.getAttr(main, "switch", "switch");
+    payload["power"] = switchVal === "on";
 
-    const mute = getAttr(main, "audioMute", "mute");
-    deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "mute", mute === "muted", {
-      type: "boolean",
-      category: "generic",
-    });
+    const volume = this.getAttr(main, "audioVolume", "volume");
+    if (typeof volume === "number") payload["volume"] = volume;
 
-    // Prefer samsungvd.mediaInputSource over standard
+    const mute = this.getAttr(main, "audioMute", "mute");
+    payload["mute"] = mute === "muted";
+
     const inputSource =
-      getAttr(main, "samsungvd.mediaInputSource", "inputSource") ??
-      getAttr(main, "mediaInputSource", "inputSource");
-    if (inputSource !== null) {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "input_source", inputSource, {
-        type: "enum",
-        category: "generic",
-      });
-    }
+      this.getAttr(main, "samsungvd.mediaInputSource", "inputSource") ??
+      this.getAttr(main, "mediaInputSource", "inputSource");
+    if (inputSource !== null) payload["input_source"] = inputSource;
 
-    const pictureMode = getAttr(main, "custom.picturemode", "pictureMode");
-    if (pictureMode !== null) {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "picture_mode", pictureMode, {
-        type: "enum",
-        category: "generic",
-      });
-    }
+    const pictureMode = this.getAttr(main, "custom.picturemode", "pictureMode");
+    if (pictureMode !== null) payload["picture_mode"] = pictureMode;
+
+    this.deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, payload);
   }
 
-  function updateWasher(deviceLabel: string, main: Record<string, Record<string, { value: unknown }>>): void {
-    const switchVal = getAttr(main, "switch", "switch");
-    deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "power", switchVal === "on", {
-      type: "boolean",
-      category: "generic",
-    });
+  private updateWasher(deviceLabel: string, main: Record<string, Record<string, { value: unknown }>>): void {
+    const payload: Record<string, unknown> = {};
 
-    // Prefer samsungce operating state
+    const switchVal = this.getAttr(main, "switch", "switch");
+    payload["power"] = switchVal === "on";
+
     const operatingState =
-      getAttr(main, "samsungce.washerOperatingState", "operatingState") ??
-      getAttr(main, "washerOperatingState", "machineState");
-    if (operatingState !== null) {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "state", operatingState, {
-        type: "enum",
-        category: "generic",
-      });
-    }
+      this.getAttr(main, "samsungce.washerOperatingState", "operatingState") ??
+      this.getAttr(main, "washerOperatingState", "machineState");
+    if (operatingState !== null) payload["state"] = operatingState;
 
     const jobPhase =
-      getAttr(main, "samsungce.washerOperatingState", "washerJobPhase") ??
-      getAttr(main, "washerOperatingState", "washerJobState");
-    if (jobPhase !== null) {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "job_phase", jobPhase, {
-        type: "enum",
-        category: "generic",
-      });
-    }
+      this.getAttr(main, "samsungce.washerOperatingState", "washerJobPhase") ??
+      this.getAttr(main, "washerOperatingState", "washerJobState");
+    if (jobPhase !== null) payload["job_phase"] = jobPhase;
 
-    const progress = getAttr(main, "samsungce.washerOperatingState", "progress");
-    if (typeof progress === "number") {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "progress", progress, {
-        type: "number",
-        category: "generic",
-        unit: "%",
-      });
-    }
+    const progress = this.getAttr(main, "samsungce.washerOperatingState", "progress");
+    if (typeof progress === "number") payload["progress"] = progress;
 
-    const remainingTime = getAttr(main, "samsungce.washerOperatingState", "remainingTime");
-    if (typeof remainingTime === "number") {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "remaining_time", remainingTime, {
-        type: "number",
-        category: "generic",
-        unit: "min",
-      });
-    }
+    const remainingTime = this.getAttr(main, "samsungce.washerOperatingState", "remainingTime");
+    if (typeof remainingTime === "number") payload["remaining_time"] = remainingTime;
 
-    const remainingTimeStr = getAttr(main, "samsungce.washerOperatingState", "remainingTimeStr");
-    if (remainingTimeStr !== null) {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "remaining_time_str", String(remainingTimeStr), {
-        type: "text",
-        category: "generic",
-      });
-    }
+    const remainingTimeStr = this.getAttr(main, "samsungce.washerOperatingState", "remainingTimeStr");
+    if (remainingTimeStr !== null) payload["remaining_time_str"] = String(remainingTimeStr);
 
     // Energy
-    const powerConsumption = getAttr(main, "powerConsumptionReport", "powerConsumption") as {
+    const powerConsumption = this.getAttr(main, "powerConsumptionReport", "powerConsumption") as {
       energy?: number;
     } | null;
-    if (powerConsumption?.energy !== undefined) {
-      deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "energy", powerConsumption.energy, {
-        type: "number",
-        category: "energy",
-        unit: "Wh",
-      });
-    }
+    if (powerConsumption?.energy !== undefined) payload["energy"] = powerConsumption.energy;
+
+    this.deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, payload);
   }
 
   // ── Poll cycle ───────────────────────────────────────────
 
-  async function poll(): Promise<void> {
+  private async poll(): Promise<void> {
     try {
-      // Re-discover to catch new/removed devices
-      await discover();
+      await this.discover();
 
-      // Poll status for each known device
-      for (const [deviceId, device] of knownDevices) {
+      for (const [deviceId, device] of this.knownDevices) {
         try {
-          const deviceStatus = await apiGet<STDeviceStatus>(`/devices/${deviceId}/status`);
+          const deviceStatus = await this.apiGet<STDeviceStatus>(`/devices/${deviceId}/status`);
           const main = deviceStatus.components?.main;
           if (!main) continue;
 
           const deviceLabel = device.label ?? device.name;
 
-          if (isTV(device)) {
-            updateTV(deviceLabel, main);
-          } else if (isWasher(device)) {
-            updateWasher(deviceLabel, main);
+          if (this.isTV(device)) {
+            this.updateTV(deviceLabel, main);
+          } else if (this.isWasher(device)) {
+            this.updateWasher(deviceLabel, main);
           } else {
-            // Generic: just update power
-            const switchVal = getAttr(main, "switch", "switch");
+            const switchVal = this.getAttr(main, "switch", "switch");
             if (switchVal !== null) {
-              deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, "power", switchVal === "on", {
-                type: "boolean",
-                category: "generic",
+              this.deviceManager.updateDeviceData(INTEGRATION_ID, deviceLabel, {
+                power: switchVal === "on",
               });
             }
           }
         } catch (err) {
-          logger.warn(
+          this.logger.warn(
             { err: err instanceof Error ? { message: err.message } : {}, deviceId },
             "Failed to poll device status",
           );
         }
       }
 
-      lastPollAt = new Date().toISOString();
-      if (status !== "connected") {
-        status = "connected";
+      this.lastPollAt = new Date().toISOString();
+      if (this.status !== "connected") {
+        this.status = "connected";
+        this.eventBus.emit({ type: "system.integration.connected", integrationId: INTEGRATION_ID });
       }
 
-      logger.debug({ devices: knownDevices.size }, "SmartThings poll complete");
+      this.logger.debug({ devices: this.knownDevices.size }, "SmartThings poll complete");
     } catch (err) {
-      logger.error(
+      this.logger.error(
         { err: err instanceof Error ? { message: err.message } : {} },
         "SmartThings poll failed",
       );
-      status = "error";
+      this.status = "error";
     }
+  }
+
+  // ── Lifecycle ────────────────────────────────────────────
+
+  async start(): Promise<void> {
+    this.logger.info("SmartThings plugin starting");
+
+    const intervalSetting = this.getSetting("polling_interval");
+    if (intervalSetting) {
+      const parsed = parseInt(intervalSetting, 10);
+      if (!isNaN(parsed) && parsed >= 60) {
+        this.pollIntervalMs = parsed * 1000;
+      }
+    }
+    if (this.pollIntervalMs < MIN_POLL_INTERVAL) {
+      this.pollIntervalMs = MIN_POLL_INTERVAL;
+    }
+
+    await this.poll();
+
+    this.pollTimer = setInterval(() => {
+      this.poll().catch((err) => {
+        this.logger.error(
+          { err: err instanceof Error ? { message: err.message } : {} },
+          "SmartThings poll error",
+        );
+      });
+    }, this.pollIntervalMs);
+
+    this.logger.info(
+      { intervalMs: this.pollIntervalMs, devices: this.knownDevices.size },
+      "SmartThings plugin started",
+    );
+  }
+
+  async stop(): Promise<void> {
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
+    }
+    this.status = "disconnected";
+    this.eventBus.emit({ type: "system.integration.disconnected", integrationId: INTEGRATION_ID });
+    this.logger.info("SmartThings plugin stopped");
+  }
+
+  async refresh(): Promise<void> {
+    await this.poll();
   }
 
   // ── Order execution ──────────────────────────────────────
 
-  async function executeOrder(deviceSourceId: string, key: string, value: unknown): Promise<void> {
-    // Find device by label
+  async executeOrder(
+    device: Device,
+    dispatchConfig: Record<string, unknown>,
+    value: unknown,
+  ): Promise<void> {
+    // Find SmartThings device ID by sourceDeviceId (label)
     let targetDeviceId: string | null = null;
-    for (const [id, device] of knownDevices) {
-      if ((device.label ?? device.name) === deviceSourceId) {
+    for (const [id, stDevice] of this.knownDevices) {
+      if ((stDevice.label ?? stDevice.name) === device.sourceDeviceId) {
         targetDeviceId = id;
         break;
       }
     }
 
     if (!targetDeviceId) {
-      throw new Error(`Device "${deviceSourceId}" not found`);
+      throw new Error(`SmartThings device "${device.sourceDeviceId}" not found`);
+    }
+
+    const command = dispatchConfig["command"] as string | undefined;
+    if (!command) {
+      throw new Error("Missing 'command' in dispatchConfig");
     }
 
     const commands: Array<{ component: string; capability: string; command: string; arguments?: unknown[] }> = [];
 
-    switch (key) {
-      case "power":
+    switch (command) {
+      case "switch":
         commands.push({
           component: "main",
           capability: "switch",
           command: value ? "on" : "off",
         });
         break;
-      case "volume":
+      case "setVolume":
         commands.push({
           component: "main",
           capability: "audioVolume",
@@ -492,7 +544,7 @@ export function createPlugin(deps: PluginDeps): IntegrationPlugin {
           command: value ? "mute" : "unmute",
         });
         break;
-      case "input_source":
+      case "setInputSource":
         commands.push({
           component: "main",
           capability: "samsungvd.mediaInputSource",
@@ -501,72 +553,21 @@ export function createPlugin(deps: PluginDeps): IntegrationPlugin {
         });
         break;
       default:
-        throw new Error(`Unknown order key: ${key}`);
+        throw new Error(`Unknown SmartThings command: ${command}`);
     }
 
-    await apiPost(`/devices/${targetDeviceId}/commands`, { commands });
-    logger.info({ deviceSourceId, key, value }, "SmartThings order executed");
+    await this.apiPost(`/devices/${targetDeviceId}/commands`, { commands });
+    this.logger.info(
+      { deviceId: targetDeviceId, command, value },
+      "SmartThings order executed",
+    );
   }
+}
 
-  // ── Plugin interface ─────────────────────────────────────
+// ============================================================
+// Plugin entry point
+// ============================================================
 
-  return {
-    id: INTEGRATION_ID,
-    name: "Samsung SmartThings",
-    description: "Samsung SmartThings devices (TV, washing machine, and more)",
-    icon: "Smartphone",
-
-    getSettings: () => SETTINGS,
-
-    getStatus: () => status,
-
-    isConfigured: () => !!getSetting("token"),
-
-    start: async () => {
-      logger.info({}, "SmartThings plugin starting");
-
-      // Parse polling interval
-      const intervalSetting = getSetting("polling_interval");
-      if (intervalSetting) {
-        const parsed = parseInt(intervalSetting, 10);
-        if (!isNaN(parsed) && parsed >= 60) {
-          pollIntervalMs = parsed * 1000;
-        }
-      }
-      if (pollIntervalMs < MIN_POLL_INTERVAL) {
-        pollIntervalMs = MIN_POLL_INTERVAL;
-      }
-
-      // Initial poll
-      await poll();
-
-      // Schedule periodic polls
-      pollTimer = setInterval(() => {
-        poll().catch((err) => {
-          logger.error(
-            { err: err instanceof Error ? { message: err.message } : {} },
-            "SmartThings poll error",
-          );
-        });
-      }, pollIntervalMs);
-
-      logger.info({ intervalMs: pollIntervalMs, devices: knownDevices.size }, "SmartThings plugin started");
-    },
-
-    stop: async () => {
-      if (pollTimer) {
-        clearInterval(pollTimer);
-        pollTimer = null;
-      }
-      status = "disconnected";
-      logger.info({}, "SmartThings plugin stopped");
-    },
-
-    executeOrder,
-
-    getPollingInfo: () =>
-      lastPollAt
-        ? { lastPollAt, intervalMs: pollIntervalMs }
-        : null,
-  };
+export function createPlugin(deps: PluginDeps): IntegrationPlugin {
+  return new SmartThingsPlugin(deps);
 }
