@@ -280,14 +280,16 @@ class SmartThingsPlugin implements IntegrationPlugin {
     const body = new URLSearchParams({
       grant_type: "authorization_code",
       code,
-      client_id: clientId,
-      client_secret: clientSecret,
       redirect_uri: redirectUri,
     });
 
+    const credentials = btoa(`${clientId}:${clientSecret}`);
     const res = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${credentials}`,
+      },
       body: body.toString(),
     });
 
@@ -326,13 +328,15 @@ class SmartThingsPlugin implements IntegrationPlugin {
     const body = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-      client_id: clientId,
-      client_secret: clientSecret,
     });
 
+    const credentials = btoa(`${clientId}:${clientSecret}`);
     const res = await fetch(OAUTH_TOKEN_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${credentials}`,
+      },
       body: body.toString(),
     });
 
