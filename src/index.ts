@@ -551,8 +551,13 @@ class SmartThingsPlugin implements IntegrationPlugin {
 
       const remainingTimeStr = this.getAttr(main, "samsungce.washerOperatingState", "remainingTimeStr");
       if (remainingTimeStr !== null) payload["remaining_time_str"] = String(remainingTimeStr);
+    } else {
+      // Power off → cycle finished: set state to "ready" so state-watch recipes can trigger
+      payload["state"] = "ready";
+      payload["progress"] = 0;
+      payload["remaining_time"] = 0;
+      payload["remaining_time_str"] = "00:00";
     }
-    // When power=off, don't update state/progress/time — keep last known values.
 
     // Energy — compute delta from cumulative counter, persisted in settings
     const powerConsumption = this.getAttr(main, "powerConsumptionReport", "powerConsumption") as {
