@@ -1,7 +1,7 @@
 {
   "id": "smartthings",
   "name": "Samsung SmartThings",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Samsung SmartThings devices (TV, washing machine, and more)",
   "icon": "Smartphone",
   "author": "mchacher",
