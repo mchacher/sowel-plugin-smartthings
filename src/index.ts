@@ -50,7 +50,7 @@ interface DiscoveredDevice {
   orders: {
     key: string;
     type: string;
-    dispatchConfig: Record<string, unknown>;
+    dispatchConfig?: Record<string, unknown>;
     min?: number;
     max?: number;
     enumValues?: string[];
@@ -104,6 +104,7 @@ interface IntegrationPlugin {
   readonly name: string;
   readonly description: string;
   readonly icon: string;
+  readonly apiVersion?: number;
   getStatus(): IntegrationStatus;
   isConfigured(): boolean;
   getSettingsSchema(): IntegrationSettingDef[];
@@ -111,7 +112,7 @@ interface IntegrationPlugin {
   stop(): Promise<void>;
   executeOrder(
     device: Device,
-    dispatchConfig: Record<string, unknown>,
+    orderKeyOrDispatchConfig: string | Record<string, unknown>,
     value: unknown,
   ): Promise<void>;
   refresh?(): Promise<void>;
@@ -153,6 +154,12 @@ interface OAuthTokenResponse {
 
 const INTEGRATION_ID = "smartthings";
 const SOURCE = "smartthings";
+
+const ORDER_KEY_TO_COMMAND: Record<string, string> = {
+  power: "switch",
+  mute: "mute",
+  input_source: "setInputSource",
+};
 const API_BASE = "https://api.smartthings.com/v1";
 const OAUTH_AUTHORIZE_URL = "https://api.smartthings.com/oauth/authorize";
 const OAUTH_TOKEN_URL = "https://api.smartthings.com/oauth/token";
@@ -202,6 +209,7 @@ class SmartThingsPlugin implements IntegrationPlugin {
   readonly name = "Samsung SmartThings";
   readonly description = "Samsung SmartThings devices (TV, washing machine, and more)";
   readonly icon = "Smartphone";
+  readonly apiVersion = 2;
 
   private logger: Logger;
   private eventBus: EventBus;
@@ -438,21 +446,21 @@ class SmartThingsPlugin implements IntegrationPlugin {
 
     if (this.isTV(device)) {
       data.push(
-        { key: "power", type: "boolean", category: "generic" },
-        { key: "volume", type: "number", category: "generic" },
-        { key: "mute", type: "boolean", category: "generic" },
-        { key: "input_source", type: "enum", category: "generic" },
+        { key: "power", type: "boolean", category: "power" },
+        { key: "volume", type: "number", category: "media_volume" },
+        { key: "mute", type: "boolean", category: "media_mute" },
+        { key: "input_source", type: "enum", category: "media_input" },
         { key: "picture_mode", type: "enum", category: "generic" },
       );
       orders.push(
-        { key: "power", type: "boolean", dispatchConfig: { command: "switch" } },
-        { key: "mute", type: "boolean", dispatchConfig: { command: "mute" } },
-        { key: "input_source", type: "enum", enumValues: [], dispatchConfig: { command: "setInputSource" } },
+        { key: "power", type: "boolean" },
+        { key: "mute", type: "boolean" },
+        { key: "input_source", type: "enum", enumValues: [] },
       );
     } else if (this.isWasher(device)) {
       data.push(
-        { key: "power", type: "boolean", category: "generic" },
-        { key: "state", type: "enum", category: "generic" },
+        { key: "power", type: "boolean", category: "power" },
+        { key: "state", type: "enum", category: "appliance_state" },
         { key: "job_phase", type: "enum", category: "generic" },
         { key: "progress", type: "number", category: "generic", unit: "%" },
         { key: "remaining_time", type: "number", category: "generic", unit: "min" },
@@ -464,7 +472,7 @@ class SmartThingsPlugin implements IntegrationPlugin {
         c.capabilities.some((cap) => cap.id === "switch"),
       );
       if (hasSwitchCap) {
-        data.push({ key: "power", type: "boolean", category: "generic" });
+        data.push({ key: "power", type: "boolean", category: "power" });
       }
     }
 
@@ -690,7 +698,7 @@ class SmartThingsPlugin implements IntegrationPlugin {
 
   async executeOrder(
     device: Device,
-    dispatchConfig: Record<string, unknown>,
+    orderKey: string,
     value: unknown,
   ): Promise<void> {
     let targetDeviceId: string | null = null;
@@ -705,9 +713,9 @@ class SmartThingsPlugin implements IntegrationPlugin {
       throw new Error(`SmartThings device "${device.sourceDeviceId}" not found`);
     }
 
-    const command = dispatchConfig["command"] as string | undefined;
+    const command = ORDER_KEY_TO_COMMAND[orderKey];
     if (!command) {
-      throw new Error("Missing 'command' in dispatchConfig");
+      throw new Error(`Unknown order key: ${orderKey}`);
     }
 
     const commands: Array<{ component: string; capability: string; command: string; arguments?: unknown[] }> = [];
