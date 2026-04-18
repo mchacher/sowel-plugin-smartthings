@@ -50,6 +50,7 @@ interface DiscoveredDevice {
   orders: {
     key: string;
     type: string;
+    category?: string;
     dispatchConfig?: Record<string, unknown>;
     min?: number;
     max?: number;
@@ -453,9 +454,9 @@ class SmartThingsPlugin implements IntegrationPlugin {
         { key: "picture_mode", type: "enum", category: "generic" },
       );
       orders.push(
-        { key: "power", type: "boolean" },
-        { key: "mute", type: "boolean" },
-        { key: "input_source", type: "enum", enumValues: [] },
+        { key: "power", type: "boolean", category: "toggle_power" },
+        { key: "mute", type: "boolean", category: "toggle_mute" },
+        { key: "input_source", type: "enum", category: "set_input", enumValues: [] },
       );
     } else if (this.isWasher(device)) {
       data.push(
